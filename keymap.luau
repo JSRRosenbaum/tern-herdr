@@ -13,6 +13,8 @@ local DEFAULTS: { [string]: string } = {
 	next_workspace = "",
 	switch_workspace = "",
 	previous_agent = "",
+	previous_herd = "",
+	next_herd = "",
 	next_agent = "",
 	new_tab = "prefix+c",
 	rename_tab = "prefix+shift+t",
@@ -101,6 +103,9 @@ end
 
 -- The byte a ctrl+letter prefix sends.
 local function ctrl_byte(prefix: string): string?
+	if prefix == "ctrl+space" then
+		return "\0"
+	end
 	local letter = string.match(prefix, "^ctrl%+(%a)$")
 	if letter then
 		return string.char(string.byte(string.lower(letter)) - 96)
@@ -115,20 +120,22 @@ function M.load(toml: string): { prefix: string, prefix_byte: string?, bindings:
 	for action, default in DEFAULTS do
 		local spec = user[action] or default
 		local rest = string.match(spec, "^prefix%+(.+)$")
-		if rest then
+		local chord_prefix = rest and (prefix .. ">") or ""
+		rest = rest or spec
+		if rest ~= "" then
 			local base, from, to = string.match(rest, "^(.-)(%d)%.%.(%d)$")
 			if base then
 				for n = tonumber(from) :: number, tonumber(to) :: number do
 					local keys = {}
 					for _, s in spellings(base .. n) do
-						table.insert(keys, prefix .. ">" .. s)
+						table.insert(keys, chord_prefix .. s)
 					end
 					table.insert(bindings, { action = action, chord = keys[1], keys = keys, n = n })
 				end
 			else
 				local keys = {}
 				for _, s in spellings(rest) do
-					table.insert(keys, prefix .. ">" .. s)
+					table.insert(keys, chord_prefix .. s)
 				end
 				table.insert(bindings, { action = action, chord = keys[1], keys = keys })
 			end
@@ -138,6 +145,53 @@ function M.load(toml: string): { prefix: string, prefix_byte: string?, bindings:
 		return a.chord < b.chord
 	end)
 	return { prefix = prefix, prefix_byte = ctrl_byte(prefix), bindings = bindings }
+end
+
+-- Build an opt-in user-layer overlay from Tern's effective keymap, not guessed defaults.
+-- `effective` comes from cx.actions:keys() before this overlay is installed. Preserve
+-- every pre-existing action as a fallback when the Herdr command is unavailable.
+function M.proposal(bindings: { Binding }, prefix: string, effective: { [string]: { string } },
+	user: { [string]: string | { string } }): { keybinds: { [string]: string | { string } }, blocked: { string } }
+	local keybinds = table.clone(user)
+	local blocked = {}
+	local occupied_prefix = effective[prefix]
+	if occupied_prefix and #occupied_prefix > 0 then
+		table.insert(blocked, prefix .. " already runs a single-chord action; sequences cannot share it")
+	end
+
+	local requested: { [string]: string } = {}
+	local function add(chord: string, action: string)
+		local previous = requested[chord]
+		if previous and previous ~= action then
+			table.insert(blocked, chord .. " has two Herdr actions: " .. previous .. " and " .. action)
+			return
+		end
+		requested[chord] = action
+		local prior = user[chord]
+		if prior == "unbind" or (type(prior) == "table" and #prior == 0) then
+			-- An explicit user unbind is intentional; do not silently undo it.
+			return
+		end
+		local actions = { action }
+		local fallback = prior or effective[chord] or {}
+		if type(fallback) == "string" then
+			fallback = { fallback }
+		end
+		for _, candidate in fallback do
+			if candidate ~= action and not string.match(candidate, "^plugin%.herdr%.key_") then
+				table.insert(actions, candidate)
+			end
+		end
+		keybinds[chord] = actions
+	end
+
+	for _, b in bindings do
+		for _, chord in b.keys do
+			add(chord, "plugin.herdr.key_" .. b.action .. (b.n and ("_" .. b.n) or ""))
+		end
+	end
+	add(prefix .. ">" .. prefix, "plugin.herdr.key_send_prefix")
+	return { keybinds = keybinds, blocked = blocked }
 end
 
 function M.title(action: string): string

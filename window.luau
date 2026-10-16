@@ -20,8 +20,8 @@ local summary = "" -- counts string; a change refreshes the chrome
 local function all_agents(): { common.Agent }
 	local out = {}
 	for _, m in machines do
-		local snap = snaps[m]
-		if snap then
+		local snap = snaps[m.id]
+		if snap and not snap.err then
 			for _, a in snap.agents do
 				table.insert(out, a)
 			end
@@ -62,7 +62,8 @@ local function notify(cx: WindowCx, a: common.Agent, before: string?)
 	if before == a.status then
 		return
 	end
-	local where = common.basename(a.cwd) .. (a.machine ~= "local" and (" on " .. a.machine) or "")
+	local profile = common.machine(a.machine)
+	local where = common.basename(a.cwd) .. (profile and profile.target ~= "local" and (" on " .. profile.label) or "")
 	if a.status == "blocked" then
 		cx:toast("error", a.agent .. " needs input · " .. where, common.label(a))
 	elseif a.status == "done" and before == "working" then
@@ -72,18 +73,24 @@ end
 
 local function after_poll(cx: WindowCx?)
 	local agents = all_agents()
-	local now = {}
+	local now = table.clone(last or {})
+	for key in now do
+		local machine = string.match(key, "^(.-)|")
+		local snap = machine and snaps[machine]
+		if snap then
+			now[key] = nil
+		end
+	end
 	for _, a in agents do
 		local key = a.machine .. "|" .. a.pane_id
 		now[key] = a.status
-		-- The first poll only records states; toasts start from the second.
-		if last and cx then
+		if last and last[key] and cx then
 			notify(cx, a, last[key])
 		end
 	end
 	last = now
 	local c = common.counts(agents)
-	local key = string.format("%d/%d/%d/%d", c.blocked or 0, c.working or 0, c.done or 0, c.idle or 0)
+	local key = string.format("%d/%d/%d/%d/%d", c.blocked or 0, c.working or 0, c.done or 0, c.idle or 0, c.unknown or 0)
 	if key ~= summary then
 		summary = key
 		tern.chrome.refresh()
@@ -144,23 +151,102 @@ local function sidebar_link(cx: WindowCx): (string?, number?, number?)
 	return nil, nil, nil
 end
 
+-- Do not automatically focus a follower while it still runs the old attach
+-- client. A later pane focus choice or another retarget cancels the handoff.
+local follower_focus: { [string]: number } = {}
+local function focus_after_attach(link: string, sidebar: number, term: number, machine: string, terminal_id: string)
+	local generation = (follower_focus[link] or 0) + 1
+	follower_focus[link] = generation
+	local function check(cx: WindowCx?)
+		if not cx or follower_focus[link] ~= generation or cx.session:focused() ~= sidebar
+			or not cx.session:pane(sidebar) or not cx.session:pane(term) then
+			return
+		end
+		local desired_machine, desired_terminal = common.link_target(link)
+		if desired_machine ~= machine or desired_terminal ~= terminal_id then
+			return
+		end
+		local attached_machine, attached_terminal = common.attached_link_target(link)
+		if attached_machine == machine and attached_terminal == terminal_id then
+			cx.layout:focus(term)
+		else
+			tern.timer(100, check)
+		end
+	end
+	tern.timer(100, check)
+end
+
 local function open_sidebar(cx: WindowCx, machine: string?, terminal_id: string?)
+	if machine and not common.machine(machine) then
+		cx:toast("error", "Saved Herdr machine profile unavailable", machine)
+		return
+	end
+	local native = common.machine("local/default")
+	local attach_supported = native and native.attach_supported
+	if not attach_supported and terminal_id then
+		cx:toast("error", "Herdr native attach unavailable", "Local HERDR_BIN needs terminal native-attach (TSP); opening inventory only")
+		terminal_id = nil
+	end
 	local link, sidebar, term = sidebar_link(cx)
 	if link and sidebar then
+		follower_focus[link] = (follower_focus[link] or 0) + 1
 		if machine and terminal_id then
-			common.retarget(link, term, machine, terminal_id, function(pane, text)
-				cx:run(pane, text)
-			end)
+			common.retarget(link, machine, terminal_id)
 		end
-		cx.layout:focus(term or sidebar)
+		local desired_machine, desired_terminal = common.link_target(link)
+		local attached_machine, attached_terminal = common.attached_link_target(link)
+		if attach_supported and term and attached_machine and
+			(not machine or (attached_machine == machine and attached_terminal == terminal_id)) then
+			cx.layout:focus(term)
+		else
+			cx.layout:focus(sidebar)
+			if attach_supported and term and desired_machine and desired_terminal then
+				focus_after_attach(link, sidebar, term, desired_machine, desired_terminal)
+			end
+		end
 		return
 	end
 	link = common.new_link()
-	if not (machine and terminal_id) then
-		local a = all_agents()[1]
-		if a then
-			machine, terminal_id = a.machine, a.terminal_id
+	if not machine then
+		local _, selected = common.organization()
+		local remembered = tern.kv.get("herd:last:" .. selected)
+		local p = type(remembered) == "string" and pane_by_key(remembered)
+		local profile = p and common.machine(p.machine)
+		if p and profile and profile.herd == selected and profile.attach_supported and p.terminal_id ~= ""
+			and snaps[p.machine] and not snaps[p.machine].err then
+			machine, terminal_id = p.machine, p.terminal_id
 		end
+		if not machine then
+			for _, candidate in common.machines() do
+				local snap = snaps[candidate.id]
+				if candidate.herd == selected and candidate.attach_supported and snap and not snap.err then
+					for _, pane in snap.panes do
+						if pane.focused and pane.terminal_id ~= "" then
+							machine, terminal_id = candidate.id, pane.terminal_id
+							break
+						end
+					end
+					if machine then break end
+				end
+			end
+		end
+		if not machine then
+			for _, a in all_agents() do
+				local candidate = common.machine(a.machine)
+				if candidate and candidate.herd == selected and candidate.attach_supported and a.terminal_id ~= "" then
+					machine, terminal_id = a.machine, a.terminal_id
+					break
+				end
+			end
+		end
+	end
+	if not attach_supported then
+		local pane = cx.layout:new_tab({ block = "herdr.sidebar",
+			args = machine and { link, machine } or { link } }, { focus = true })
+		if not pane then
+			cx:toast("error", "Could not open the Herdr inventory")
+		end
+		return
 	end
 	if machine and terminal_id then
 		tern.fs.write(common.target_file(link), common.encode_target(machine, terminal_id))
@@ -169,7 +255,7 @@ local function open_sidebar(cx: WindowCx, machine: string?, terminal_id: string?
 		name = "herdr",
 		split = "right",
 		ratio = SIDEBAR_RATIO,
-		{ launch = { block = "herdr.sidebar", args = { link, machine or "local" } } },
+		{ launch = { block = "herdr.sidebar", args = machine and { link, machine } or { link } } },
 		{ launch = { command = common.follow_command(link) } },
 	})
 	if not tab then
@@ -177,11 +263,18 @@ local function open_sidebar(cx: WindowCx, machine: string?, terminal_id: string?
 		return
 	end
 	local layout = cx.session:layout(tab)
+	local left = layout and layout.root and layout.root[1]
 	local right = layout and layout.root and layout.root[2]
+	local sidebar_pane = left and left.pane
 	local terminal = right and right.pane
 	if terminal then
 		tern.kv.set("link:" .. link, terminal)
-		cx.layout:focus(terminal)
+	end
+	if sidebar_pane then
+		cx.layout:focus(sidebar_pane)
+		if terminal and machine and terminal_id then
+			focus_after_attach(link, sidebar_pane, terminal, machine, terminal_id)
+		end
 	end
 end
 
@@ -215,8 +308,9 @@ local function tab_name(snap: Snapshot, t: Tab): string
 	if #common.tabs_of(snap, t.workspace_id) > 1 then
 		name ..= " · " .. t.label
 	end
-	if snap.machine ~= "local" then
-		name = snap.machine .. ": " .. name
+	if snap.machine ~= "local/default" then
+		local profile = common.machine(snap.machine)
+		name = (profile and profile.label or snap.machine) .. ": " .. name
 	end
 	return name
 end
@@ -239,9 +333,10 @@ local function sync_mirror(cx: WindowCx)
 	local was_focused = cx.session:focused()
 	local created = false
 
-	for _, machine in machines do
+	for _, profile in machines do
+		local machine = profile.id
 		local snap = snaps[machine]
-		if snap and not snap.err then
+		if snap and not snap.err and profile.attach_supported then
 			for _, t in snap.tabs do
 				local anchor: number? = nil
 				for _, p in common.panes_of(snap, t.id) do
@@ -261,7 +356,7 @@ local function sync_mirror(cx: WindowCx)
 						local link = pane_link(p.key)
 						tern.fs.write(common.target_file(link), common.encode_target(machine, p.terminal_id))
 						local launch = { command = common.follow_command(link) }
-						if machine == "local" then
+						if profile.target == "local" then
 							launch.cwd = p.cwd
 						end
 						local term
@@ -349,11 +444,15 @@ end
 
 -- Snapshots every machine, then runs `done` once with the last callback's cx.
 local function snapshot_all(done: (WindowCx?) -> ())
+	machines = common.machines()
 	local pending = #machines
+	if pending == 0 then
+		done(nil)
+		return
+	end
 	local cx_seen: WindowCx? = nil
-	for i, machine in machines do
-		-- One timer per machine: spawning every machine's processes in one callback can pass
-		-- the window's 50 ms budget.
+	for i, profile in machines do
+		local machine = profile.id
 		tern.timer((i - 1) * 60, function()
 			common.snapshot(machine, function(snap, cx)
 				snaps[machine] = snap
@@ -404,12 +503,14 @@ local function current(cx: WindowCx): Pane?
 	end
 	for key, term in mirror_map() do
 		if term == focused then
-			return pane_by_key(key)
+			local pane = pane_by_key(key)
+			local machine, terminal = common.attached_link_target(pane_link(key))
+			return pane and machine == pane.machine and terminal == pane.terminal_id and pane or nil
 		end
 	end
 	local link, sidebar, term = sidebar_link(cx)
 	if link and (focused == sidebar or focused == term) then
-		local machine, terminal = common.link_target(link)
+		local machine, terminal = common.attached_link_target(link)
 		local snap = machine and snaps[machine]
 		return snap and terminal and common.pane_by_terminal(snap, terminal) or nil
 	end
@@ -418,6 +519,21 @@ end
 
 -- Shows a Herdr pane: its mirrored Tern pane, else the sidebar terminal.
 local function show(cx: WindowCx, p: Pane)
+	local profile = common.machine(p.machine)
+	if not profile or not profile.attach_supported then
+		cx:toast("error", "Herdr terminal attach unavailable",
+			profile and "Local Herdr needs terminal native-attach (TSP)" or p.machine)
+		return
+	end
+	local snap = snaps[p.machine]
+	if not snap or snap.err then
+		cx:toast("error", "Herdr machine unavailable", snap and snap.err or "No snapshot for " .. profile.label)
+		return
+	end
+	if profile then
+		tern.kv.set("herd:selected", profile.herd)
+		tern.kv.set("herd:last:" .. profile.herd, p.key)
+	end
 	local term = mirror_on() and mirror_map()[p.key]
 	if term and cx.session:pane(term) then
 		cx.layout:focus(term)
@@ -479,7 +595,12 @@ local function index_of(list: { any }, pred: (any) -> boolean): number
 end
 
 local function tab_pane(snap: Snapshot?, t: Tab?): Pane?
-	return snap and t and common.panes_of(snap, t.id)[1] or nil
+	if not snap or not t then return nil end
+	local panes = common.panes_of(snap, t.id)
+	for _, pane in panes do
+		if pane.focused then return pane end
+	end
+	return panes[1]
 end
 
 local function workspace_pane(snap: Snapshot?, w: Workspace?): Pane?
@@ -603,6 +724,75 @@ local function agent_pane(snap: Snapshot, a: any): Pane?
 	return a and snap.panes[a.pane_id] or nil
 end
 
+-- Traverse Herdr's persisted herd membership, focusing only surviving existing panes.
+local function traverse_herd(cx: WindowCx, p: Pane?, delta: number)
+	local count, selected, _, org_error = common.organization()
+	if org_error then
+		cx:toast("error", "Herdr herd membership unavailable", org_error)
+		open_sidebar(cx, nil, nil)
+		return
+	end
+	if count < 2 then
+		return
+	end
+	local profile = p and common.machine(p.machine)
+	local navigation_herd = tonumber(tern.kv.get("herd:selected"))
+	local current_herd = if navigation_herd and navigation_herd >= 0 and navigation_herd < count
+		then navigation_herd else (profile and profile.herd or selected)
+	local herd = (current_herd + delta + count) % count
+	tern.kv.set("herd:selected", herd)
+	local remembered = tern.kv.get("herd:last:" .. herd)
+	if type(remembered) == "string" then
+		local machine = string.match(remembered, "^(.-)|")
+		local snap = machine and snaps[machine]
+		local saved_profile = machine and common.machine(machine)
+		if saved_profile and saved_profile.herd == herd and snap then
+			if snap.err then
+				cx:toast("error", saved_profile.label .. " unavailable", snap.err)
+				open_sidebar(cx, machine, nil)
+				return
+			end
+			local target = pane_by_key(remembered)
+			if target and target.terminal_id ~= "" then
+				show(cx, target)
+				return
+			end
+			for _, w in snap.workspaces do
+				target = workspace_pane(snap, w)
+				if target and target.terminal_id ~= "" then
+					show(cx, target)
+					return
+				end
+			end
+		end
+	end
+	for _, machine in common.machines() do
+		if machine.herd == herd and machine.attach_supported then
+			local snap = snaps[machine.id]
+			if snap and not snap.err then
+				for _, w in snap.workspaces do
+					if w.focused then
+						local target = workspace_pane(snap, w)
+						if target and target.terminal_id ~= "" then
+							show(cx, target)
+							return
+						end
+					end
+				end
+				for _, w in snap.workspaces do
+					local target = workspace_pane(snap, w)
+					if target and target.terminal_id ~= "" then
+						show(cx, target)
+						return
+					end
+				end
+			end
+		end
+	end
+	cx:toast("info", "Herd " .. herd .. " has no reachable attachable terminal", "Sidebar inventory remains available")
+	open_sidebar(cx, nil, nil)
+end
+
 -- Handlers by Herdr action name. `n` is the 1-based index of indexed bindings.
 local ACTIONS: { [string]: (cx: WindowCx, p: Pane?, n: number?) -> () } = {
 	new_tab = function(cx, p)
@@ -613,7 +803,7 @@ local ACTIONS: { [string]: (cx: WindowCx, p: Pane?, n: number?) -> () } = {
 		end
 	end,
 	new_workspace = function(cx, p)
-		local machine = p and p.machine or "local"
+		local machine = p and p.machine or "local/default"
 		local args = { "workspace", "create", "--no-focus" }
 		if p then
 			table.insert(args, "--cwd")
@@ -652,6 +842,12 @@ local ACTIONS: { [string]: (cx: WindowCx, p: Pane?, n: number?) -> () } = {
 			herdr(cx, p.machine, { "workspace", "close", p.workspace_id })
 		end
 	end,
+	next_herd = function(cx, p)
+		traverse_herd(cx, p, 1)
+	end,
+	previous_herd = function(cx, p)
+		traverse_herd(cx, p, -1)
+	end,
 	next_tab = function(cx, p)
 		within(cx, p, space_tabs, same_tab, 1, tab_pane)
 	end,
@@ -672,7 +868,7 @@ local ACTIONS: { [string]: (cx: WindowCx, p: Pane?, n: number?) -> () } = {
 		within(cx, p, spaces, same_space, -1, workspace_pane)
 	end,
 	switch_workspace = function(cx, p, n)
-		local snap = snaps[p and p.machine or "local"]
+		local snap = snaps[p and p.machine or "local/default"]
 		local target = snap and n and workspace_pane(snap, snap.workspaces[n])
 		if target then
 			show(cx, target)
@@ -728,22 +924,62 @@ local ACTIONS: { [string]: (cx: WindowCx, p: Pane?, n: number?) -> () } = {
 	end,
 }
 
-local function in_herdr(cx: WindowCx): boolean
-	return current(cx) ~= nil
+-- Claim Herdr chords while an attachment switches, but never run a backend action
+-- against the old or merely requested target. Outside these panes Tern fallbacks win.
+local function in_herdr_context(cx: WindowCx): boolean
+	local focused = cx.session:focused()
+	if not focused then
+		return false
+	end
+	for _, term in mirror_map() do
+		if term == focused then
+			return true
+		end
+	end
+	local _, sidebar, term = sidebar_link(cx)
+	return focused == sidebar or focused == term
 end
+
+-- Only palette commands can be overridden. A preset/default chord that names
+-- one of these commands still reaches Herdr when its attached pane has focus.
+-- Non-command actions (goto_tab:N, focus_pane:DIR) need the user-layer overlay.
+local COMMAND_ACTIONS = {
+	new_tab = "new_tab",
+	next_tab = "next_tab",
+	previous_tab = "previous_tab",
+	next_tab_across_sessions = "next_herd",
+	previous_tab_across_sessions = "previous_herd",
+	split_right = "split_vertical",
+	split_down = "split_horizontal",
+}
+for command, action in COMMAND_ACTIONS do
+	tern.override(command, function(cx)
+		local p = current(cx)
+		if p then
+			ACTIONS[action](cx, p)
+			return true
+		end
+		return in_herdr_context(cx)
+	end)
+end
+
 
 local bound = keymap.load(common.herdr_config())
 for _, b in bound.bindings do
 	local handler = ACTIONS[b.action]
+	local herd_action = b.action == "next_herd" or b.action == "previous_herd"
 	if handler then
 		tern.command({
 			id = "key_" .. b.action .. (b.n and ("_" .. b.n) or ""),
 			title = "Herdr: " .. keymap.title(b.action) .. (b.n and (" " .. b.n) or ""),
 			group = "Herdr keys",
 			keys = b.keys,
-			available = in_herdr,
+			available = in_herdr_context,
 			run = function(cx)
-				handler(cx, current(cx), b.n)
+				local p = current(cx)
+				if p or (herd_action and in_herdr_context(cx)) then
+					handler(cx, p, b.n)
+				end
 			end,
 		})
 	end
@@ -755,14 +991,39 @@ tern.command({
 	title = "Herdr: Send Prefix",
 	group = "Herdr keys",
 	keys = { bound.prefix .. ">" .. bound.prefix },
-	available = in_herdr,
+	available = in_herdr_context,
 	run = function(cx)
-		local focused = cx.session:focused()
+		local focused = current(cx) and cx.session:focused()
 		if focused and bound.prefix_byte then
 			cx:run(focused, bound.prefix_byte)
 		end
 	end,
 })
+-- Opt-in setup: export an exact user-layer overlay without changing settings.
+-- A user binding wins over defaults/presets, and its ordered fallback retains
+-- the effective Tern action whenever the Herdr command is unavailable.
+tern.command({
+	id = "keybind_proposal",
+	title = "Herdr: Export Keybinding Proposal",
+	group = "Herdr keys",
+	run = function(cx)
+		local effective = cx.actions:keys()
+		local proposal = keymap.proposal(bound.bindings, bound.prefix, effective, cx.settings:keybinds())
+		local path = tern.plugin.data .. "/keybinds-proposal.json"
+		tern.fs.write(path, tern.json.encode({
+			keybinds = proposal.keybinds,
+			blocked = proposal.blocked,
+			prefix = bound.prefix,
+			prefix_actions = effective[bound.prefix] or {},
+		}))
+		if #proposal.blocked > 0 then
+			cx:toast("error", "Herdr keybinding proposal needs resolution", table.concat(proposal.blocked, "; "))
+		else
+			cx:toast("info", "Herdr keybinding proposal exported", path)
+		end
+	end,
+})
+
 
 ---------------------------------------------------------------------------------------------------
 -- Palette commands
@@ -789,7 +1050,7 @@ tern.command({
 		else
 			tern.kv.set("mirror", {})
 			sync_mirror(cx)
-			cx:toast("success", "Herdr tabs mirrored")
+			cx:toast("info", "Herdr mirror enabled", "Only reachable profiles with supported terminal attach are eligible")
 		end
 	end,
 })
@@ -827,4 +1088,4 @@ tern.chrome.tab_title(function(tab)
 end)
 
 -- window_start does not fire again on a plugin reload, so polling starts at load.
-poll()
+common.refresh_attach_support(poll)

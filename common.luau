@@ -53,50 +53,164 @@ function M.herdr_config(): string
 end
 
 ---------------------------------------------------------------------------------------------------
--- Machines: "local", then each ssh target in ~/.config/tern-herdr/machines (one per line, # comments).
+-- Saved Herdr endpoints, not SSH hostnames: profiles on one host can name different sessions.
+-- Herdr owns endpoints.json and client-shell state; this plugin only reads them.
 
-function M.machines(): { string }
-	local list = { "local" }
-	for line in string.gmatch(read(config_dir() .. "/tern-herdr/machines") .. "\n", "([^\n]*)\n") do
-		local target = string.match(line, "^%s*([^#%s]+)")
-		if target and target ~= "local" and not table.find(list, target) then
-			table.insert(list, target)
+export type Machine = { id: string, label: string, session: string, target: string, herd: number, attach_supported: boolean }
+
+local function decode_file(path: string): any?
+	local text = read(path)
+	if text == "" then
+		return nil
+	end
+	local ok, doc = pcall(tern.json.decode, text)
+	return ok and type(doc) == "table" and doc or nil
+end
+
+local function shell_state(): (any?, string?)
+	local override = tern.getenv("TERN_HERDR_CLIENT_STATE")
+	if override and override ~= "" then
+		return decode_file(override), override
+	end
+	local dir = (tern.getenv("XDG_STATE_HOME") or (home .. "/.local/state")) .. "/herdr/client-shell"
+	local ok, names = pcall(tern.fs.list, dir)
+	if not ok then
+		return nil, "Herdr client state not found; set TERN_HERDR_CLIENT_STATE to its client-shell/local-*.json"
+	end
+	local found = {}
+	for _, name in names do
+		if string.match(name, "^local%-[%w%-]+%.json$") then
+			table.insert(found, dir .. "/" .. name)
 		end
 	end
+	if #found ~= 1 then
+		return nil, "Expected one Herdr client-shell/local-*.json; set TERN_HERDR_CLIENT_STATE to select yours"
+	end
+	local doc = decode_file(found[1])
+	return doc, doc and nil or ("Could not read Herdr client state " .. found[1])
+end
+
+function M.organization(): (number, number, { [string]: number }, string?)
+	local doc, err = shell_state()
+	if not doc then
+		return 1, 0, {}, err
+	end
+	local count = math.max(1, tonumber(doc.herd_count) or 1)
+	local selected = math.clamp(tonumber(doc.selected_herd) or 0, 0, count - 1)
+	local memberships = {}
+	for _, entry in doc.machine_herds or {} do
+		local id = if entry.profile_id == nil then "local/default" else entry.profile_id
+		if type(id) == "string" and type(entry.herd) == "number" then
+			memberships[id] = entry.herd
+		end
+	end
+	return count, selected, memberships, nil
+end
+
+function M.collapsed(): { [string]: boolean }
+	local doc = shell_state()
+	local result = {}
+	if doc then
+		for _, key in doc.collapsed_groups or {} do
+			result["local/default|" .. key] = true
+		end
+		for _, remote in doc.remote_collapsed_groups or {} do
+			for _, key in remote.collapsed_groups or {} do
+				result[remote.profile_id .. "|" .. key] = true
+			end
+		end
+	end
+	return result
+end
+
+local machine_cache: { Machine }? = nil
+local machine_cache_at = 0
+
+-- Native follower requires the local Herdr TSP attach command. Probe its unique help
+-- marker without contacting any saved profile; never spawn a follower on ANSI-only Herdr.
+local native_supported = false
+local native_checked = false
+local native_waiters: { () -> () } = {}
+function M.refresh_attach_support(done: () -> ())
+	if native_checked then
+		done()
+		return
+	end
+	table.insert(native_waiters, done)
+	if #native_waiters > 1 then
+		return
+	end
+	tern.process.run({ M.herdr, "--machine", "00000000000000000000000000000000", "terminal", "native-attach", "--help" },
+		{ timeout_ms = 3000 }, function(res)
+			native_supported = res.status == 0 and string.find(res.stdout, "native-terminal-attach-v1", 1, true) ~= nil
+			native_checked = true
+			machine_cache = nil
+			local waiters = native_waiters
+			native_waiters = {}
+			for _, callback in waiters do
+				callback()
+			end
+		end)
+end
+
+function M.machines(): { Machine }
+	if machine_cache and os.time() - machine_cache_at < 2 then
+		return machine_cache
+	end
+	local _, _, memberships, org_error = M.organization()
+	local list: { Machine } = { { id = "local/default", label = "local", target = "local", session = "default",
+		herd = org_error and -1 or (memberships["local/default"] or 0), attach_supported = native_supported } }
+	local sessions = config_dir() .. "/herdr/sessions"
+	local ok, names = pcall(tern.fs.list, sessions)
+	if ok then
+		for _, name in names do
+			if not string.find(name, "[/%s]") and tern.fs.exists(sessions .. "/" .. name .. "/herdr.sock") then
+				table.insert(list, { id = "local/" .. name, label = "local · " .. name, target = "local", session = name, herd = 0, attach_supported = native_supported })
+			end
+		end
+	end
+	local doc = decode_file((tern.getenv("XDG_STATE_HOME") or (home .. "/.local/state")) .. "/herdr/client/endpoints.json")
+	for _, entry in doc and doc.ssh or {} do
+		if entry.enabled == true and type(entry.id) == "string" and type(entry.label) == "string"
+			and type(entry.target) == "string" and type(entry.session) == "string" then
+			table.insert(list, { id = entry.id, label = entry.label, target = entry.target, session = entry.session,
+				herd = org_error and -1 or (memberships[entry.id] or 0), attach_supported = native_supported })
+		end
+	end
+	machine_cache = list
+	machine_cache_at = os.time()
 	return list
+end
+
+function M.machine(id: string): Machine?
+	for _, m in M.machines() do
+		if m.id == id then
+			return m
+		end
+	end
+	return nil
 end
 
 function M.quote(s: string): string
 	return "'" .. string.gsub(s, "'", "'\\''") .. "'"
 end
 
--- argv that runs `herdr ARGS…` on `machine`.
+-- Herdr's saved-profile API forwarding preserves the configured session on a shared SSH host.
 function M.argv(machine: string, args: { string }): { string }
-	if machine == "local" then
-		local argv = { M.herdr }
-		for _, a in args do
-			table.insert(argv, a)
-		end
-		return argv
+	local argv = { M.herdr }
+	if string.sub(machine, 1, 6) == "local/" then
+		table.insert(argv, "--session")
+		table.insert(argv, string.sub(machine, 7))
+	else
+		table.insert(argv, "--machine")
+		table.insert(argv, machine)
 	end
-	local words = { "herdr" }
 	for _, a in args do
-		table.insert(words, M.quote(a))
+		table.insert(argv, a)
 	end
-	return { "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", machine, table.concat(words, " ") }
+	return argv
 end
 
--- argv that runs a plain command on `machine` (for git and the like).
-function M.shell_argv(machine: string, args: { string }): { string }
-	if machine == "local" then
-		return args
-	end
-	local words = {}
-	for _, a in args do
-		table.insert(words, M.quote(a))
-	end
-	return { "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", machine, table.concat(words, " ") }
-end
 
 ---------------------------------------------------------------------------------------------------
 -- Integrations: Herdr marks one "available" when it isn't installed and the agent's command is
@@ -110,51 +224,54 @@ local INTEGRATION_COMMANDS: { [string]: { string } } = {
 
 export type Integration = { name: string, state: string, available: boolean }
 
--- Reads `herdr integration status` and probes agent commands on `machine` in a login shell.
+-- Integration status is CLI text. Probe PATH only for local profiles: saved remote
+-- endpoints may be Windows and must not be treated as POSIX login shells.
 function M.integrations(machine: string, done: ({ Integration }?, string?) -> ())
-	local names = { "pi", "omp", "claude", "codex", "copilot", "devin", "droid", "kimi", "opencode",
-		"kilo", "hermes", "qodercli", "qwen", "cursor", "mastracode", "antigravity-cli", "grok", "letta" }
-	local commands = {}
-	for _, n in names do
-		for _, c in INTEGRATION_COMMANDS[n] or { n } do
-			table.insert(commands, c)
-		end
-	end
-	local herdr_cmd = machine == "local" and M.quote(M.herdr) or "herdr"
-	local script = herdr_cmd .. " integration status; echo '--- found'; for c in "
-		.. table.concat(commands, " ") .. "; do command -v \"$c\" >/dev/null 2>&1 && echo \"$c\"; done"
-	local argv
-	if machine == "local" then
-		argv = { tern.getenv("SHELL") or "/bin/zsh", "-lc", script }
-	else
-		argv = { "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", machine, "bash -lc " .. M.quote(script) }
-	end
-	tern.process.run(argv, { timeout_ms = 15000 }, function(res)
-		if res.timed_out or not string.find(res.stdout, "--- found", 1, true) then
-			done(nil, (string.gsub(res.stderr, "%s+$", "")))
+	tern.process.run(M.argv(machine, { "integration", "status" }), { timeout_ms = 10000 }, function(res)
+		local err = (res.timed_out and "herdr timed out")
+			or (res.status ~= 0 and string.gsub(res.stderr .. res.stdout, "%s+$", ""))
+		if err then
+			done(nil, err)
 			return
 		end
-		local status_text, found_text = string.match(res.stdout, "^(.-)%-%-%- found\n?(.*)$")
-		local found = {}
-		for c in string.gmatch(found_text or "", "%S+") do
-			found[c] = true
-		end
 		local list = {}
-		for line in string.gmatch(status_text or "", "[^\n]+") do
+		for line in string.gmatch(res.stdout, "[^\n]+") do
 			local name, rest = string.match(line, "^([%w%-]+)[^:]*:%s*(.*)$")
 			if name then
 				local state = string.find(rest, "^current") and "current"
 					or string.find(rest, "^outdated") and "outdated"
 					or string.find(rest, "^not installed") and "missing"
 					or "unknown"
-				local available = false
-				for _, c in INTEGRATION_COMMANDS[name] or { name } do
-					available = available or found[c] == true
-				end
-				table.insert(list, { name = name, state = state, available = available })
+				table.insert(list, { name = name, state = state, available = false })
 			end
 		end
-		done(list, nil)
+		if string.sub(machine, 1, 6) ~= "local/" then
+			done(list, nil)
+			return
+		end
+		local names = { "pi", "omp", "claude", "codex", "copilot", "devin", "droid", "kimi", "opencode",
+			"kilo", "hermes", "qodercli", "qwen", "cursor", "mastracode", "antigravity-cli", "grok", "letta" }
+		local commands = {}
+		for _, n in names do
+			for _, c in INTEGRATION_COMMANDS[n] or { n } do
+				table.insert(commands, c)
+			end
+		end
+		local script = "for c in " .. table.concat(commands, " ") .. "; do command -v \"$c\" >/dev/null 2>&1 && echo \"$c\"; done"
+		tern.process.run({ tern.getenv("SHELL") or "/bin/sh", "-lc", script }, { timeout_ms = 5000 }, function(probe)
+			if probe.status == 0 then
+				local found = {}
+				for name in string.gmatch(probe.stdout, "%S+") do
+					found[name] = true
+				end
+				for _, entry in list do
+					for _, c in INTEGRATION_COMMANDS[entry.name] or { entry.name } do
+						entry.available = entry.available or found[c] == true
+					end
+				end
+			end
+			done(list, nil)
+		end)
 	end)
 end
 
@@ -165,9 +282,9 @@ end
 ---------------------------------------------------------------------------------------------------
 -- State
 
-M.STATES = { "blocked", "working", "done", "idle" }
-M.RANK = { blocked = 1, working = 2, done = 3, idle = 4 }
-M.TONE = { blocked = "error", working = "warn", done = "success", idle = "muted" }
+M.STATES = { "blocked", "working", "done", "idle", "unknown" }
+M.RANK = { blocked = 1, working = 2, done = 3, idle = 4, unknown = 5 }
+M.TONE = { blocked = "error", working = "warn", done = "success", idle = "muted", unknown = "muted" }
 
 export type Agent = {
 	machine: string,
@@ -182,9 +299,10 @@ export type Agent = {
 	focused: boolean,
 }
 
-export type Workspace = { machine: string, id: string, label: string, number: number, status: string, active_tab: string?, focused: boolean }
+export type Workspace = { machine: string, id: string, label: string, number: number, status: string, active_tab: string?, focused: boolean,
+	worktree: { checkout_path: string, is_linked_worktree: boolean, repo_key: string, repo_name: string, repo_root: string }? }
 export type Tab = { machine: string, id: string, workspace_id: string, label: string, number: number, status: string, focused: boolean }
-export type Pane = { machine: string, id: string, key: string, terminal_id: string, tab_id: string, workspace_id: string, cwd: string }
+export type Pane = { machine: string, id: string, key: string, terminal_id: string, tab_id: string, workspace_id: string, cwd: string, focused: boolean }
 
 export type Snapshot = {
 	machine: string,
@@ -200,8 +318,8 @@ local function failure(res: any): string?
 		return "herdr timed out"
 	end
 	if res.status ~= 0 then
-		local msg = (res.stderr ~= "" and res.stderr) or res.stdout
-		return (string.gsub(msg, "%s+$", ""))
+		local msg = string.gsub((res.stderr ~= "" and res.stderr) or res.stdout, "%s+$", "")
+		return msg ~= "" and msg or ("herdr exited with status " .. tostring(res.status))
 	end
 	return nil
 end
@@ -246,7 +364,7 @@ function M.agents_from(machine: string, rows: { any }): { Agent }
 				pane_id = a.pane_id,
 				terminal_id = a.terminal_id or "",
 				agent = a.agent,
-				status = a.agent_status or "idle",
+				status = a.agent_status or "unknown",
 				title = a.terminal_title_stripped or a.terminal_title or "",
 				cwd = a.foreground_cwd or a.cwd or "",
 				workspace_id = a.workspace_id or "",
@@ -267,8 +385,9 @@ local function build(machine: string, ws: any, ts: any, ps: any): Snapshot
 			id = w.workspace_id,
 			label = w.label or w.workspace_id,
 			number = w.number or 0,
-			status = w.agent_status or "idle",
+			status = w.agent_status or "unknown",
 			active_tab = w.active_tab_id,
+			worktree = w.worktree,
 			focused = w.focused == true,
 		})
 	end
@@ -286,7 +405,7 @@ local function build(machine: string, ws: any, ts: any, ps: any): Snapshot
 			workspace_id = t.workspace_id,
 			label = t.label or tostring(t.number),
 			number = t.number or 0,
-			status = t.agent_status or "idle",
+			status = t.agent_status or "unknown",
 			focused = t.focused == true,
 		})
 	end
@@ -306,17 +425,31 @@ local function build(machine: string, ws: any, ts: any, ps: any): Snapshot
 			tab_id = p.tab_id or "",
 			workspace_id = p.workspace_id or "",
 			cwd = p.foreground_cwd or p.cwd or "",
+			focused = p.focused == true,
 		}
 	end
 	snap.agents = M.agents_from(machine, ps)
 	return snap
 end
 
--- Reads one machine's workspaces, tabs and panes. `done` gets the snapshot and, in the window,
--- the cx of the last process callback.
+-- One flight per profile in each plugin VM; the sidebar and tab strip share it. On failure
+-- keep the last successful view but mark it unavailable (never show stale activity as live).
+local cache: { [string]: { snap: Snapshot, at: number } } = {}
+local waiting: { [string]: { (Snapshot, any) -> () } } = {}
+
 function M.snapshot(machine: string, done: (Snapshot, any) -> ())
+	local cached = cache[machine]
+	if cached and os.time() - cached.at < 2 then
+		done(cached.snap, nil)
+		return
+	end
+	if waiting[machine] then
+		table.insert(waiting[machine], done)
+		return
+	end
+	waiting[machine] = { done }
 	local results: { [string]: any } = {}
-	local got, err = 0, nil
+	local got, err, context = 0, nil, nil
 	local function one(args: { string }, field: string)
 		tern.process.run(M.argv(machine, args), { timeout_ms = 8000 }, function(res, cx)
 			local value, why = M.decode(res, field)
@@ -325,20 +458,42 @@ function M.snapshot(machine: string, done: (Snapshot, any) -> ())
 			else
 				err = err or why
 			end
+			context = cx or context
 			got += 1
-			if got < 3 then
+			if got < 2 then
 				return
 			end
+			local live = results.snapshot
+			if not err and (type(live.workspaces) ~= "table" or type(live.tabs) ~= "table"
+				or type(live.panes) ~= "table") then
+				err = "herdr snapshot is missing workspaces, tabs or panes"
+			end
+			local snap: Snapshot
 			if err then
-				done({ machine = machine, err = err, workspaces = {}, tabs = {}, panes = {}, agents = {} }, cx)
+				local previous = cache[machine] and cache[machine].snap
+				snap = previous and { machine = machine, err = err, workspaces = previous.workspaces,
+					tabs = previous.tabs, panes = previous.panes, agents = previous.agents }
+					or { machine = machine, err = err, workspaces = {}, tabs = {}, panes = {}, agents = {} }
 			else
-				done(build(machine, results.workspaces, results.tabs, results.panes), cx)
+				local worktrees = {}
+				for _, w in results.workspaces do
+					worktrees[w.workspace_id] = w.worktree
+				end
+				for _, w in live.workspaces do
+					w.worktree = worktrees[w.workspace_id]
+				end
+				snap = build(machine, live.workspaces, live.tabs, live.panes)
+			end
+			cache[machine] = { snap = snap, at = os.time() }
+			local callbacks = waiting[machine]
+			waiting[machine] = nil
+			for _, callback in callbacks do
+				callback(snap, context)
 			end
 		end)
 	end
 	one({ "workspace", "list" }, "workspaces")
-	one({ "tab", "list" }, "tabs")
-	one({ "pane", "list" }, "panes")
+	one({ "api", "snapshot" }, "snapshot")
 end
 
 function M.tabs_of(snap: Snapshot, workspace_id: string): { Tab }
@@ -393,8 +548,7 @@ function M.label(a: Agent): string
 end
 
 ---------------------------------------------------------------------------------------------------
--- Links: a Tern pane running follow.sh shows the Herdr terminal named in its target file,
--- "MACHINE TERMINAL_ID". follow.sh writes `<file>.on` with the target it is attached to.
+-- Stable profile/session selector + terminal id. follow.sh resolves remote profile ids.
 
 function M.target_file(link: string): string
 	local dir = tern.plugin.data .. "/links"
@@ -411,28 +565,33 @@ function M.encode_target(machine: string, terminal_id: string): string
 	return machine .. " " .. terminal_id
 end
 
--- The machine and terminal a link shows (or is about to). Old single-word targets are local.
 function M.link_target(link: string): (string?, string?)
 	local text = read(M.target_file(link))
 	if text == "" then
 		return nil, nil
 	end
 	local machine, terminal = string.match(text, "^(%S+) (%S+)$")
-	if machine then
-		return machine, terminal
-	end
-	return "local", text
+	return machine, terminal
 end
 
--- Points a link's pane at a Herdr terminal. `write` types into the pane: ctrl+b q detaches the
--- current attach (Herdr's direct attach always takes it), and follow.sh attaches the new target.
-function M.retarget(link: string, term: number?, machine: string, terminal_id: string, write: (number, string) -> ())
+-- A desired target is not the pane's actual attachment during a follower switch.
+-- Only expose it to window actions once the follower reports that exact target.
+function M.attached_link_target(link: string): (string?, string?)
+	local file = M.target_file(link)
+	local desired = read(file)
+	if desired == "" or read(file .. ".on") ~= desired then
+		return nil, nil
+	end
+	return string.match(desired, "^(%S+) (%S+)$")
+end
+
+-- The follower watches this file and stops only its own local attach client on change.
+-- Never inject escape bytes into a terminal: they could reach the newly attached agent.
+function M.retarget(link: string, machine: string, terminal_id: string)
 	local file = M.target_file(link)
 	local target = M.encode_target(machine, terminal_id)
-	tern.fs.write(file, target)
-	local on = read(file .. ".on")
-	if term and on ~= "" and on ~= target then
-		write(term, "\x02q")
+	if read(file) ~= target then
+		tern.fs.write(file, target)
 	end
 end
 
