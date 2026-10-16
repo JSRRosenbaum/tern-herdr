@@ -101,6 +101,8 @@ Or clone it and run `tern plugin link .` to use it in place. Run `tern plugin ty
 
 When updating the local CLI and plugin, recreate the Herdr follower panes (close and reopen the Herdr tab). Running follower shells retain their old script and environment contract. Do not restart backend agents.
 
+Reload plugin code with `tern plugin reload`; `reload_config` only refreshes settings. Keep the previous immutable CLI binary and matching plugin revision for recovery: close viewer panes, select that pair, reload plugins, and reopen the sidebar. Backend rollback is separate; session restore or replay is not a viewer-recovery step.
+
 ## OMP native renderer
 
 From a checkout of this repository, install the companion for **future OMP processes**:
