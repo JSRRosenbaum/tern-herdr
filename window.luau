@@ -176,7 +176,7 @@ local function focus_after_attach(link: string, sidebar: number, term: number, m
 	tern.timer(100, check)
 end
 
-local function open_sidebar(cx: WindowCx, machine: string?, terminal_id: string?, requested_herd: number?)
+local function open_sidebar_ready(cx: WindowCx, machine: string?, terminal_id: string?, requested_herd: number?)
 	if machine and not common.machine(machine) then
 		cx:toast("error", "Saved Herdr machine profile unavailable", machine)
 		return
@@ -284,6 +284,16 @@ local function open_sidebar(cx: WindowCx, machine: string?, terminal_id: string?
 			focus_after_attach(link, sidebar_pane, terminal, machine, terminal_id, common.view_mode(machine, terminal_id))
 		end
 	end
+end
+
+local function open_sidebar(_cx: WindowCx, machine: string?, terminal_id: string?, requested_herd: number?)
+	common.refresh_attach_support(function()
+		tern.timer(1, function(cx: WindowCx?)
+			if cx then
+				open_sidebar_ready(cx, machine, terminal_id, requested_herd)
+			end
+		end)
+	end)
 end
 
 ---------------------------------------------------------------------------------------------------

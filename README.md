@@ -89,6 +89,8 @@ Herdr settings, help, resize mode, scrollback editing and worktree creation comm
 
 Requires Tern with plugin/TSP support and a local Linux/macOS Herdr client advertising `scoped-terminal-attach-v2`. Older local clients expose inventory only; a follower also checks this capability before launch. Native remote servers need `native-terminal-attach-v1`, including Windows servers with the complete ConPTY package. Native input is opaque: `ctrl+b q` is not a native detach command.
 
+Opening the sidebar waits for the local capability probe, including immediately after plugin reload, before choosing a viewer or inventory-only layout.
+
 ## Install
 
 ```sh
