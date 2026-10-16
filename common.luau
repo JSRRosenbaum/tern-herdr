@@ -126,8 +126,8 @@ end
 local machine_cache: { Machine }? = nil
 local machine_cache_at = 0
 
--- Native follower requires the local Herdr TSP attach command. Probe its unique help
--- marker without contacting any saved profile; never spawn a follower on ANSI-only Herdr.
+-- The local follower needs both native transport and the scoped-input/ready ABI.
+-- Probe local help only; older clients remain inventory-only, including ANSI mode.
 local native_supported = false
 local native_checked = false
 local native_waiters: { () -> () } = {}
@@ -142,7 +142,9 @@ function M.refresh_attach_support(done: () -> ())
 	end
 	tern.process.run({ M.herdr, "--machine", "00000000000000000000000000000000", "terminal", "native-attach", "--help" },
 		{ timeout_ms = 3000 }, function(res)
-			native_supported = res.status == 0 and string.find(res.stdout, "native-terminal-attach-v1", 1, true) ~= nil
+			native_supported = res.status == 0
+				and string.find(res.stdout, "native-terminal-attach-v1", 1, true) ~= nil
+				and string.find(res.stdout, "scoped-terminal-attach-v2", 1, true) ~= nil
 			native_checked = true
 			machine_cache = nil
 			local waiters = native_waiters
@@ -450,8 +452,10 @@ function M.snapshot(machine: string, done: (Snapshot, any) -> ())
 	waiting[machine] = { done }
 	local results: { [string]: any } = {}
 	local got, err, context = 0, nil, nil
+	-- Saved SSH calls include remote shell startup and Herdr's bounded SSH probes.
+	local timeout_ms = if string.sub(machine, 1, 6) == "local/" then 8000 else 30000
 	local function one(args: { string }, field: string)
-		tern.process.run(M.argv(machine, args), { timeout_ms = 8000 }, function(res, cx)
+		tern.process.run(M.argv(machine, args), { timeout_ms = timeout_ms }, function(res, cx)
 			local value, why = M.decode(res, field)
 			if value then
 				results[field] = value
@@ -547,8 +551,24 @@ function M.label(a: Agent): string
 	return a.agent .. " in " .. M.basename(a.cwd)
 end
 
----------------------------------------------------------------------------------------------------
--- Stable profile/session selector + terminal id. follow.sh resolves remote profile ids.
+-- Terminal IDs are server-owned, stable across pane/tab reordering and scoped
+-- by machine here. A new terminal identity defaults to native; resuming the
+-- same terminal retains its choice.
+local function view_key(machine: string, terminal_id: string): string
+	return "view:" .. machine .. "|" .. terminal_id
+end
+
+function M.view_mode(machine: string, terminal_id: string): string
+	return if tern.kv.get(view_key(machine, terminal_id)) == "ansi" then "ansi" else "native"
+end
+
+function M.set_view_mode(machine: string, terminal_id: string, mode: string)
+	assert(mode == "native" or mode == "ansi")
+	tern.kv.set(view_key(machine, terminal_id), mode)
+end
+
+-- Exact target bytes are also the follower's input lease and readiness value.
+-- A mode switch revokes the old reader even when selector and terminal agree.
 
 function M.target_file(link: string): string
 	local dir = tern.plugin.data .. "/links"
@@ -561,35 +581,42 @@ function M.follow_command(link: string): string
 	return "sh " .. M.quote(tern.plugin.dir .. "/follow.sh") .. " " .. M.quote(M.target_file(link)) .. " " .. M.quote(M.herdr)
 end
 
-function M.encode_target(machine: string, terminal_id: string): string
-	return machine .. " " .. terminal_id
+function M.encode_target(machine: string, terminal_id: string, mode: string): string
+	assert(mode == "native" or mode == "ansi")
+	return machine .. " " .. terminal_id .. " " .. mode
 end
 
-function M.link_target(link: string): (string?, string?)
-	local text = read(M.target_file(link))
-	if text == "" then
-		return nil, nil
+local function decode_target(text: string): (string?, string?, string?)
+	local machine, terminal, mode = string.match(text, "^(%S+) (%S+) (native)$")
+	if not mode then
+		machine, terminal, mode = string.match(text, "^(%S+) (%S+) (ansi)$")
 	end
-	local machine, terminal = string.match(text, "^(%S+) (%S+)$")
-	return machine, terminal
+	return machine, terminal, mode
+end
+
+function M.link_target(link: string): (string?, string?, string?)
+	return decode_target(read(M.target_file(link)))
 end
 
 -- A desired target is not the pane's actual attachment during a follower switch.
 -- Only expose it to window actions once the follower reports that exact target.
-function M.attached_link_target(link: string): (string?, string?)
+function M.attached_link_target(link: string): (string?, string?, string?)
 	local file = M.target_file(link)
 	local desired = read(file)
 	if desired == "" or read(file .. ".on") ~= desired then
-		return nil, nil
+		return nil, nil, nil
 	end
-	return string.match(desired, "^(%S+) (%S+)$")
+	return decode_target(desired)
 end
 
 -- The follower watches this file and stops only its own local attach client on change.
 -- Never inject escape bytes into a terminal: they could reach the newly attached agent.
 function M.retarget(link: string, machine: string, terminal_id: string)
+	if not native_supported then
+		return
+	end
 	local file = M.target_file(link)
-	local target = M.encode_target(machine, terminal_id)
+	local target = M.encode_target(machine, terminal_id, M.view_mode(machine, terminal_id))
 	if read(file) ~= target then
 		tern.fs.write(file, target)
 	end

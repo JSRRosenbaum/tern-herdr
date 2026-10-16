@@ -1,8 +1,8 @@
 schema = 1
 id = "herdr"
 name = "Herdr"
-version = "0.5.0"
-description = "Native Herdr/TSP terminals with saved machine/session profiles, persisted herds, repository/worktree navigation, status and safe input handoff."
+version = "0.5.1"
+description = "Herdr with explicit Native TSP or ANSI views, saved machine/session profiles, persisted herds, repository/worktree navigation and safe input handoff."
 icon = "user"
 host = "host.luau"
 window = "window.luau"

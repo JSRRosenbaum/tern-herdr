@@ -1,7 +1,7 @@
 #!/bin/sh
 # Keeps this pane attached to the Herdr terminal named in the target file.
-# Targets are "SELECTOR TERMINAL_ID": local/default, local/<session>, or a saved
-# Herdr machine profile ID. The profile, not its SSH host, selects the remote session.
+# Targets are "SELECTOR TERMINAL_ID MODE": local/default, local/<session>,
+# or a saved Herdr profile ID; MODE is explicitly native or ansi.
 # The plugin changes the file; this loop stops only its local attach client
 # with SIGTERM, so no escape key can leak into a different terminal.
 #   follow.sh TARGET_FILE [LOCAL_HERDR_BIN]
@@ -25,8 +25,18 @@ while :; do
 		continue
 	fi
 	waiting=""
-	selector=${target% *}
-	terminal=${target##* }
+	selector=${target%% *}
+	rest=${target#* }
+	terminal=${rest%% *}
+	mode=${rest#* }
+	case "$mode" in
+		native|ansi) ;;
+		*)
+			printf 'Invalid Herdr presentation mode in target file.\n' >&2
+			waiting="$target"
+			continue
+			;;
+	esac
 	case "$terminal" in
 		''|*[!a-zA-Z0-9_.-]*)
 			printf 'Invalid Herdr terminal ID in target file.\n' >&2
@@ -74,20 +84,34 @@ while :; do
 			machine=remote
 			;;
 	esac
+	# Check every launch, including restored layouts and a downgraded local CLI.
+	# This help path never contacts a saved profile or starts its backend.
+	support=$("$local_herdr" --machine 00000000000000000000000000000000 terminal native-attach --help 2>/dev/null)
+	support_status=$?
+	case "$support_status:$support" in
+		0:*native-terminal-attach-v1*scoped-terminal-attach-v2*) ;;
+		*)
+			printf 'Herdr viewer unavailable: upgrade local HERDR_BIN to scoped-terminal-attach-v2; inventory remains available.\n' >&2
+			exit 1
+			;;
+	esac
 	if [ "$machine" = local ]; then
-		HERDR_NATIVE_ATTACH_TARGET_FILE="$file" HERDR_NATIVE_ATTACH_TARGET="$target" \
-			HERDR_NATIVE_ATTACH_READY_FILE="$on" \
-			"$local_herdr" --session "$session" terminal native-attach "$terminal" </dev/tty &
+		set -- "$local_herdr" --session "$session" terminal
 	else
-		# The local Unix client attaches through the saved profile's SSH socket
-		# bridge; this also works with a Windows Herdr server.
-		HERDR_NATIVE_ATTACH_TARGET_FILE="$file" HERDR_NATIVE_ATTACH_TARGET="$target" \
-			HERDR_NATIVE_ATTACH_READY_FILE="$on" \
-			"$local_herdr" --machine "$selector" terminal native-attach "$terminal" </dev/tty &
+		# The local Unix client uses the saved profile's SSH socket bridge.
+		set -- "$local_herdr" --machine "$selector" terminal
 	fi
+	if [ "$mode" = ansi ]; then
+		set -- "$@" attach "$terminal"
+	else
+		set -- "$@" native-attach "$terminal"
+	fi
+	HERDR_ATTACH_TARGET_FILE="$file" HERDR_ATTACH_TARGET="$target" \
+		HERDR_ATTACH_READY_FILE="$on" "$@" </dev/tty &
 	child=$!
-	# The client publishes .on only after native READY. Its per-input target
-	# check revokes old input even if this observer is delayed or stopped.
+	# The client publishes .on only after native READY or the first approved
+	# classic terminal frame. Its input guard revokes stale input even if this
+	# observer is delayed or stopped.
 	switched=0
 	while kill -0 "$child" 2>/dev/null; do
 		if [ "$(cat "$file" 2>/dev/null)" != "$target" ]; then

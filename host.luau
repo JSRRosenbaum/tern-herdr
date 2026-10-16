@@ -95,7 +95,7 @@ local function show_terminal(cx: EffectCx, link: string, beside: number, machine
 	local profile = common.machine(machine)
 	if not profile or not profile.attach_supported then
 		cx:toast("error", "Cannot attach to this Herdr terminal",
-			profile and (profile.label .. " needs local Herdr terminal native-attach (TSP)") or "Saved machine profile is unavailable")
+			profile and (profile.label .. " needs local Herdr scoped-terminal-attach-v2") or "Saved machine profile is unavailable")
 		return
 	end
 	local term = linked_term(link)
@@ -180,7 +180,7 @@ local function attach_agent(state: SidebarState, cx: EffectCx, a: common.Agent)
 	if a.terminal_id == "" or not profile or not profile.attach_supported
 		or (state.snaps[a.machine] and state.snaps[a.machine].err) then
 		if profile and not profile.attach_supported then
-			cx:toast("error", "Herdr terminal attach unavailable", "Local Herdr needs terminal native-attach (TSP)")
+			cx:toast("error", "Herdr terminal attach unavailable", "Local Herdr needs scoped-terminal-attach-v2; inventory only")
 		end
 		return
 	end
@@ -219,7 +219,7 @@ local function attach_space(state: SidebarState, cx: EffectCx, machine: string, 
 	end
 	local profile = common.machine(machine)
 	if not profile or not profile.attach_supported then
-		cx:toast("error", "Herdr native attach unavailable", "Local HERDR_BIN needs terminal native-attach (TSP)")
+		cx:toast("error", "Herdr viewer unavailable", "Local HERDR_BIN needs scoped-terminal-attach-v2; inventory only")
 		return
 	end
 	for _, w in snap.workspaces do
@@ -544,6 +544,17 @@ local function act(state: SidebarState, cx: BlockCx, name: string, value: string
 		herdr(cx, machine, { "workspace", "close", w.id }, function()
 			poll(state, cx, false)
 		end)
+	elseif name == "view_ansi" or name == "view_native" then
+		local shown_machine, shown_terminal = common.link_target(state.link)
+		if shown_machine and shown_terminal then
+			local shown_profile = common.machine(shown_machine)
+			if not shown_profile or not shown_profile.attach_supported then
+				cx:toast("error", "Herdr viewer unavailable", "Upgrade local HERDR_BIN to scoped-terminal-attach-v2; inventory only")
+				return
+			end
+			common.set_view_mode(shown_machine, shown_terminal, if name == "view_ansi" then "ansi" else "native")
+			common.retarget(state.link, shown_machine, shown_terminal)
+		end
 	elseif name == "machine" and value then
 		switch_machine(state, cx, value)
 	elseif name == "herd" and value then
@@ -695,6 +706,11 @@ local function menu_view(state: SidebarState): Node
 			item("Close space " .. w.label .. "…", "close_space")
 		end
 	end
+	local shown_machine, shown_terminal, shown_mode = common.link_target(state.link)
+	if shown_machine and shown_terminal then
+		item((shown_mode == "ansi" and "● " or "○ ") .. "Use ANSI screen", "view_ansi")
+		item((shown_mode == "native" and "● " or "○ ") .. "Use Native TSP", "view_native")
+	end
 	table.insert(items, el("div", "hs-msep", ""))
 	if state.integrations then
 		local installed = 0
@@ -727,7 +743,8 @@ local sidebar: BlockDef<SidebarState> = {
 		local link = (saved and saved.link) or args[1] or common.new_link()
 		local machines = common.machines()
 		local count, selected, _, org_error = common.organization()
-		local machine = (saved and saved.machine) or args[2] or "local/default"
+		local requested_machine = if args[2] ~= "" then args[2] else nil
+		local machine = (saved and saved.machine) or requested_machine or "local/default"
 		local profile = common.machine(machine)
 		if not profile then
 			machine = "local/default"
@@ -736,8 +753,10 @@ local sidebar: BlockDef<SidebarState> = {
 		local herd = profile and profile.herd >= 0 and profile.herd or selected
 		if saved and type(saved.herd) == "number" and saved.herd >= 0 and saved.herd < count then
 			herd = saved.herd
-		elseif not args[2] and not (saved and saved.machine) then
-			herd = selected
+		elseif not requested_machine and not (saved and saved.machine) then
+			local requested_herd = tonumber(args[3])
+			herd = if requested_herd and requested_herd >= 0 and requested_herd < count
+				then requested_herd else selected
 		end
 		local last = saved and saved.last or {}
 		local last_profile = saved and saved.last_profile or {}
@@ -818,7 +837,7 @@ local sidebar: BlockDef<SidebarState> = {
 		end
 		local native = common.machine("local/default")
 		if not native or not native.attach_supported then
-			table.insert(body, el("div", "hs-err", "Native TSP attach unavailable in local HERDR_BIN; inventory only"))
+			table.insert(body, el("div", "hs-err", "Local HERDR_BIN needs scoped-terminal-attach-v2; inventory only"))
 		end
 		local spaces: { Node } = { el("div", "hs-head", "spaces") }
 		local list: { Node } = { el("div", "hs-head", "agents") }
@@ -881,10 +900,10 @@ local sidebar: BlockDef<SidebarState> = {
 		end
 		-- A premature attempt to type into the switching terminal can land on
 		-- this rail. Never turn those printable keys into backend commands.
-		local desired_machine, desired_terminal = common.link_target(state.link)
+		local desired_machine, desired_terminal, desired_mode = common.link_target(state.link)
 		if desired_machine and desired_terminal then
-			local attached_machine, attached_terminal = common.attached_link_target(state.link)
-			if attached_machine ~= desired_machine or attached_terminal ~= desired_terminal then
+			local attached_machine, attached_terminal, attached_mode = common.attached_link_target(state.link)
+			if attached_machine ~= desired_machine or attached_terminal ~= desired_terminal or attached_mode ~= desired_mode then
 				if name == "escape" then
 					state.menu = false
 					state.confirm = nil
@@ -959,7 +978,7 @@ local sidebar: BlockDef<SidebarState> = {
 				local p = common.panes_of(snap, id)[1]
 				local profile = common.machine(machine)
 				if not profile or not profile.attach_supported then
-					cx:toast("error", "Herdr native attach unavailable", "Local HERDR_BIN needs terminal native-attach (TSP)")
+					cx:toast("error", "Herdr viewer unavailable", "Local HERDR_BIN needs scoped-terminal-attach-v2; inventory only")
 					return
 				end
 				if p and p.terminal_id ~= "" then
@@ -1082,7 +1101,7 @@ local strip: BlockDef<StripState> = {
 		local profile = common.machine(machine)
 		if not profile or not profile.attach_supported then
 			cx:toast("error", "Herdr terminal attach unavailable",
-				profile and "Local Herdr needs terminal native-attach (TSP)" or machine)
+				profile and "Local Herdr needs scoped-terminal-attach-v2; inventory only" or machine)
 			return
 		end
 		if ev.act == "tab" and ev.value then

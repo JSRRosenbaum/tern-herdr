@@ -154,7 +154,7 @@ end
 -- Do not automatically focus a follower while it still runs the old attach
 -- client. A later pane focus choice or another retarget cancels the handoff.
 local follower_focus: { [string]: number } = {}
-local function focus_after_attach(link: string, sidebar: number, term: number, machine: string, terminal_id: string)
+local function focus_after_attach(link: string, sidebar: number, term: number, machine: string, terminal_id: string, mode: string)
 	local generation = (follower_focus[link] or 0) + 1
 	follower_focus[link] = generation
 	local function check(cx: WindowCx?)
@@ -162,12 +162,12 @@ local function focus_after_attach(link: string, sidebar: number, term: number, m
 			or not cx.session:pane(sidebar) or not cx.session:pane(term) then
 			return
 		end
-		local desired_machine, desired_terminal = common.link_target(link)
-		if desired_machine ~= machine or desired_terminal ~= terminal_id then
+		local desired_machine, desired_terminal, desired_mode = common.link_target(link)
+		if desired_machine ~= machine or desired_terminal ~= terminal_id or desired_mode ~= mode then
 			return
 		end
-		local attached_machine, attached_terminal = common.attached_link_target(link)
-		if attached_machine == machine and attached_terminal == terminal_id then
+		local attached_machine, attached_terminal, attached_mode = common.attached_link_target(link)
+		if attached_machine == machine and attached_terminal == terminal_id and attached_mode == mode then
 			cx.layout:focus(term)
 		else
 			tern.timer(100, check)
@@ -176,7 +176,7 @@ local function focus_after_attach(link: string, sidebar: number, term: number, m
 	tern.timer(100, check)
 end
 
-local function open_sidebar(cx: WindowCx, machine: string?, terminal_id: string?)
+local function open_sidebar(cx: WindowCx, machine: string?, terminal_id: string?, requested_herd: number?)
 	if machine and not common.machine(machine) then
 		cx:toast("error", "Saved Herdr machine profile unavailable", machine)
 		return
@@ -184,7 +184,7 @@ local function open_sidebar(cx: WindowCx, machine: string?, terminal_id: string?
 	local native = common.machine("local/default")
 	local attach_supported = native and native.attach_supported
 	if not attach_supported and terminal_id then
-		cx:toast("error", "Herdr native attach unavailable", "Local HERDR_BIN needs terminal native-attach (TSP); opening inventory only")
+		cx:toast("error", "Herdr viewer unavailable", "Local HERDR_BIN needs scoped-terminal-attach-v2; opening inventory only")
 		terminal_id = nil
 	end
 	local link, sidebar, term = sidebar_link(cx)
@@ -193,22 +193,25 @@ local function open_sidebar(cx: WindowCx, machine: string?, terminal_id: string?
 		if machine and terminal_id then
 			common.retarget(link, machine, terminal_id)
 		end
-		local desired_machine, desired_terminal = common.link_target(link)
-		local attached_machine, attached_terminal = common.attached_link_target(link)
-		if attach_supported and term and attached_machine and
-			(not machine or (attached_machine == machine and attached_terminal == terminal_id)) then
+		local desired_machine, desired_terminal, desired_mode = common.link_target(link)
+		local attached_machine, attached_terminal, attached_mode = common.attached_link_target(link)
+		if attach_supported and term and attached_machine and attached_terminal and attached_mode
+			and attached_machine == desired_machine
+			and attached_terminal == desired_terminal and attached_mode == desired_mode
+			and (not machine or (attached_machine == machine and attached_terminal == terminal_id)) then
 			cx.layout:focus(term)
 		else
 			cx.layout:focus(sidebar)
-			if attach_supported and term and desired_machine and desired_terminal then
-				focus_after_attach(link, sidebar, term, desired_machine, desired_terminal)
+			if attach_supported and term and desired_machine and desired_terminal and desired_mode then
+				focus_after_attach(link, sidebar, term, desired_machine, desired_terminal, desired_mode)
 			end
 		end
 		return
 	end
 	link = common.new_link()
 	if not machine then
-		local _, selected = common.organization()
+		local _, persisted = common.organization()
+		local selected = requested_herd or persisted
 		local remembered = tern.kv.get("herd:last:" .. selected)
 		local p = type(remembered) == "string" and pane_by_key(remembered)
 		local profile = p and common.machine(p.machine)
@@ -240,22 +243,27 @@ local function open_sidebar(cx: WindowCx, machine: string?, terminal_id: string?
 			end
 		end
 	end
+	local sidebar_args = machine and { link, machine } or { link }
+	if requested_herd ~= nil then
+		sidebar_args[2] = machine or ""
+		sidebar_args[3] = tostring(requested_herd)
+	end
 	if not attach_supported then
 		local pane = cx.layout:new_tab({ block = "herdr.sidebar",
-			args = machine and { link, machine } or { link } }, { focus = true })
+			args = sidebar_args }, { focus = true })
 		if not pane then
 			cx:toast("error", "Could not open the Herdr inventory")
 		end
 		return
 	end
 	if machine and terminal_id then
-		tern.fs.write(common.target_file(link), common.encode_target(machine, terminal_id))
+		tern.fs.write(common.target_file(link), common.encode_target(machine, terminal_id, common.view_mode(machine, terminal_id)))
 	end
 	local tab, err = cx.layout:tab({
 		name = "herdr",
 		split = "right",
 		ratio = SIDEBAR_RATIO,
-		{ launch = { block = "herdr.sidebar", args = machine and { link, machine } or { link } } },
+		{ launch = { block = "herdr.sidebar", args = sidebar_args } },
 		{ launch = { command = common.follow_command(link) } },
 	})
 	if not tab then
@@ -273,7 +281,7 @@ local function open_sidebar(cx: WindowCx, machine: string?, terminal_id: string?
 	if sidebar_pane then
 		cx.layout:focus(sidebar_pane)
 		if terminal and machine and terminal_id then
-			focus_after_attach(link, sidebar_pane, terminal, machine, terminal_id)
+			focus_after_attach(link, sidebar_pane, terminal, machine, terminal_id, common.view_mode(machine, terminal_id))
 		end
 	end
 end
@@ -354,7 +362,7 @@ local function sync_mirror(cx: WindowCx)
 				for _, p in common.panes_of(snap, t.id) do
 					if not map[p.key] and not dismissed[p.key] and p.terminal_id ~= "" then
 						local link = pane_link(p.key)
-						tern.fs.write(common.target_file(link), common.encode_target(machine, p.terminal_id))
+						tern.fs.write(common.target_file(link), common.encode_target(machine, p.terminal_id, common.view_mode(machine, p.terminal_id)))
 						local launch = { command = common.follow_command(link) }
 						if profile.target == "local" then
 							launch.cwd = p.cwd
@@ -522,7 +530,7 @@ local function show(cx: WindowCx, p: Pane)
 	local profile = common.machine(p.machine)
 	if not profile or not profile.attach_supported then
 		cx:toast("error", "Herdr terminal attach unavailable",
-			profile and "Local Herdr needs terminal native-attach (TSP)" or p.machine)
+			profile and "Local Herdr needs scoped-terminal-attach-v2; inventory only" or p.machine)
 		return
 	end
 	local snap = snaps[p.machine]
@@ -790,7 +798,7 @@ local function traverse_herd(cx: WindowCx, p: Pane?, delta: number)
 		end
 	end
 	cx:toast("info", "Herd " .. herd .. " has no reachable attachable terminal", "Sidebar inventory remains available")
-	open_sidebar(cx, nil, nil)
+	open_sidebar(cx, nil, nil, herd)
 end
 
 -- Handlers by Herdr action name. `n` is the 1-based index of indexed bindings.
@@ -1036,6 +1044,50 @@ tern.command({
 	run = function(cx)
 		open_sidebar(cx, nil, nil)
 	end,
+})
+
+-- Explicit presentation selection changes only the local viewer. Herdr's PTY
+-- remains the same; a future viewer of this terminal uses the saved choice.
+local function choose_view(cx: WindowCx, mode: string)
+	local p = current(cx)
+	if not p then
+		return
+	end
+	local focused = cx.session:focused()
+	local link: string?
+	if mirror_map()[p.key] == focused then
+		link = pane_link(p.key)
+	else
+		local sidebar_link_id, sidebar, term = sidebar_link(cx)
+		if focused == sidebar or focused == term then
+			link = sidebar_link_id
+		end
+	end
+	if link then
+		local profile = common.machine(p.machine)
+		if not profile or not profile.attach_supported then
+			cx:toast("error", "Herdr viewer unavailable", "Upgrade local HERDR_BIN to scoped-terminal-attach-v2; inventory only")
+			return
+		end
+		common.set_view_mode(p.machine, p.terminal_id, mode)
+		common.retarget(link, p.machine, p.terminal_id)
+	end
+end
+
+tern.command({
+	id = "view_ansi",
+	title = "Herdr: Use ANSI screen",
+	icon = "user",
+	available = function(cx) return current(cx) ~= nil end,
+	run = function(cx) choose_view(cx, "ansi") end,
+})
+
+tern.command({
+	id = "view_native",
+	title = "Herdr: Use Native TSP",
+	icon = "user",
+	available = function(cx) return current(cx) ~= nil end,
+	run = function(cx) choose_view(cx, "native") end,
 })
 
 tern.command({
